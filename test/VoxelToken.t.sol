@@ -16,11 +16,7 @@ contract Voxel is ERC20Capped, ERC20Burnable, Pausable, Ownable {
     /**
      * @dev Constructor that mints the total supply to the deployer and sets the cap.
      */
-    constructor()
-    ERC20("Voxel", "VXL")
-    ERC20Capped(21_000_000 * 10 ** 18)
-    Ownable(msg.sender)
-    {
+    constructor() ERC20("Voxel", "VXL") ERC20Capped(21_000_000 * 10 ** 18) Ownable(msg.sender) {
         _mint(msg.sender, cap());
     }
 
@@ -57,10 +53,7 @@ contract Voxel is ERC20Capped, ERC20Burnable, Pausable, Ownable {
     /**
      * @dev Override internal update hook to respect paused state and capped logic.
      */
-    function _update(address from, address to, uint256 value)
-    internal
-    override(ERC20, ERC20Capped)
-    {
+    function _update(address from, address to, uint256 value) internal override(ERC20, ERC20Capped) {
         require(!paused(), "Voxel: paused");
         super._update(from, to, value);
     }

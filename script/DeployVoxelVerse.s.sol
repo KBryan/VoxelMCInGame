@@ -12,16 +12,23 @@ contract DeployVoxelVerse is Script {
     // Amount of tokens to drip per day per player
     uint256 constant DAILY_DRIP_AMOUNT = 10 * 1e18; // 10 VOXEL tokens
 
+    // Default gamer tag and cost
+    string constant DEFAULT_GAMER_TAG = "Kwame";
+    uint256 constant GAMER_TAG_COST = 100 * 1e18; // 100 VOXEL tokens
+
     function run() external {
         // Start broadcasting transactions
         vm.startBroadcast();
+        bytes32 salt = keccak256("create2_deploy");
 
         // 1. Deploy the VoxelToken contract
-        Voxel voxelToken = new Voxel();
+        //Voxel voxelToken = new Voxel{salt: salt}(msg.sender); // or deployer address if declared
+        Voxel voxelToken = new Voxel(msg.sender); // or deployer address if declared
         console.log("VoxelToken deployed at:", address(voxelToken));
         console.log("Total supply: 21,000,000 VOXEL");
 
         // 2. Deploy the VoxelVerseMC contract with token address and drip amount
+        //VoxelVerseMC voxelVerseMC = new VoxelVerseMC{salt: salt}(address(voxelToken), DAILY_DRIP_AMOUNT);
         VoxelVerseMC voxelVerseMC = new VoxelVerseMC(address(voxelToken), DAILY_DRIP_AMOUNT);
         console.log("VoxelVerseMC deployed at:", address(voxelVerseMC));
         console.log("Daily drip amount:", DAILY_DRIP_AMOUNT / 1e18, "VOXEL");
@@ -33,7 +40,7 @@ contract DeployVoxelVerse is Script {
         require(transferSuccess, "Failed to fund game contract");
         console.log("Transferred", INITIAL_GAME_FUNDS / 1e18, "VOXEL to game contract");
 
-        // 4. Verify balances
+        // 5. Verify balances
         uint256 contractBalance = voxelToken.balanceOf(address(voxelVerseMC));
         uint256 ownerBalance = voxelToken.balanceOf(msg.sender);
         console.log("Game contract balance:", contractBalance / 1e18, "VOXEL");

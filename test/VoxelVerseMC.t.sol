@@ -22,7 +22,7 @@ contract VoxelVerseMCTest is Test {
         vm.startPrank(deployer);
 
         // Deploy VoxelToken
-        voxelToken = new Voxel();
+        voxelToken = new Voxel(deployer);
 
         // Deploy VoxelVerseMC
         voxelVerseMC = new VoxelVerseMC(address(voxelToken), DAILY_DRIP);

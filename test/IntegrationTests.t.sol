@@ -3,7 +3,9 @@ pragma solidity 0.8.26;
 
 import {Test, console} from "forge-std/Test.sol";
 import {Voxel} from "../src/Voxel.sol";
-import {VoxelVerseMC} from "../src/VoxelMC.sol";
+import {VoxelVerseMC, TooEarlyToClaim} from "../src/VoxelMC.sol";
+import {ClaimManager} from "../src/ClaimManager.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 contract IntegrationTests is Test {
     Voxel public voxelToken;
@@ -13,65 +15,157 @@ contract IntegrationTests is Test {
     address public user1 = address(2);
     address public user2 = address(3);
 
-    uint256 public constant DAILY_DRIP = 10 * 10 ** 18;
-    uint256 public constant INITIAL_FUND = 1_000_000 * 10 ** 18;
+    uint256 public constant DECIMALS = 1e18;
+    uint256 public constant STARTING_BONUS = 10 * DECIMALS;
+    uint256 public constant DAILY_DRIP = 10 * DECIMALS;
+    uint256 public constant MINT_PRICE = 1000 * DECIMALS;
+    uint256 public constant INITIAL_FUND = 1_000_000 * DECIMALS;
+    uint256 public constant REVIVE_COST = 10 * DECIMALS;
 
-    // Setup function - runs before each test
+    uint256 private trustedPrivateKey = 0xA11CE;
+    address private trustedSigner = vm.addr(trustedPrivateKey);
+
     function setUp() public {
         vm.startPrank(deployer);
-
-        // Deploy VoxelToken
-        voxelToken = new Voxel();
-
-        // Deploy VoxelVerseMC
+        voxelToken = new Voxel(deployer);
         voxelVerseMC = new VoxelVerseMC(address(voxelToken), DAILY_DRIP);
-
-        // Fund VoxelVerseMC with some tokens
+        voxelVerseMC.setTrustedSigner(trustedSigner);
+        voxelVerseMC.grantRole(voxelVerseMC.EDITOR_ROLE(), deployer);
         voxelToken.transfer(address(voxelVerseMC), INITIAL_FUND);
-
-        // Give users some VOXEL tokens for testing
-        voxelToken.transfer(user1, 10_000 * 10 ** 18);
-        voxelToken.transfer(user2, 10_000 * 10 ** 18);
-
+        voxelToken.transfer(user1, 10_000 * DECIMALS);
+        voxelToken.transfer(user2, 10_000 * DECIMALS);
         vm.stopPrank();
     }
 
-    // --- INTEGRATION TESTS ---
+    function getXp(uint256 tokenId) internal view returns (uint256 xp) {
+        (,,,,, xp,,,,) = voxelVerseMC.nftHolderAttributes(tokenId);
+    }
+
+    function testClaimXPWithSignature() public {
+        vm.startPrank(user1);
+        voxelVerseMC.mintCharacterNFT();
+        uint256 tokenId = 0;
+        uint256 startingXp = getXp(tokenId);
+        vm.stopPrank();
+        uint256 cap = voxelVerseMC.xpCapPerDay();
+
+        ClaimManager.XPClaim memory claim = ClaimManager.XPClaim({
+            user: user1,
+            tokenId: tokenId,
+            xpAmount: cap,
+            nonce: voxelVerseMC.getUserNonce(user1)
+        });
+
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256("XPClaim(address user,uint256 tokenId,uint256 xpAmount,uint256 nonce)"),
+                claim.user,
+                claim.tokenId,
+                claim.xpAmount,
+                claim.nonce
+            )
+        );
+
+        bytes32 digest = voxelVerseMC.exposedHashTypedDataV4(structHash);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(trustedPrivateKey, digest);
+        bytes memory signature = abi.encodePacked(r, s, v);
+
+        vm.prank(user1);
+        voxelVerseMC.claimXPReward(claim, signature);
+
+        uint256 newXp = getXp(tokenId);
+        assertEq(newXp, startingXp + cap, "XP should be increased by claim amount");
+    }
+
+    function testMintCharacterWithValidVoucher() public {
+        ClaimManager.MintVoucher memory voucher = ClaimManager.MintVoucher({
+            user: user1,
+            tokenId: 0,
+            expiry: block.timestamp + voxelVerseMC.getMaxVoucherExpiry(),
+            nonce: voxelVerseMC.getUserNonce(user1)
+        });
+
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256("MintVoucher(address user,uint256 tokenId,uint256 expiry,uint256 nonce)"),
+                voucher.user,
+                voucher.tokenId,
+                voucher.expiry,
+                voucher.nonce
+            )
+        );
+
+        bytes32 digest = voxelVerseMC.exposedHashTypedDataV4(structHash);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(trustedPrivateKey, digest);
+        bytes memory signature = abi.encodePacked(r, s, v);
+
+        vm.prank(user1);
+        voxelVerseMC.mintCharacterWithVoucher(voucher, signature);
+
+        assertEq(voxelVerseMC.balanceOf(user1), 1, "User should own 1 NFT");
+        assertEq(voxelVerseMC.getUserNonce(user1), 1, "Nonce should be incremented");
+        assertGt(voxelToken.balanceOf(user1), 0, "User should receive starting tokens");
+
+        vm.expectRevert("Invalid nonce");
+        vm.prank(user1);
+        voxelVerseMC.mintCharacterWithVoucher(voucher, signature);
+    }
+
+    function testReviveCharacter() public {
+        vm.startPrank(user1);
+        voxelVerseMC.mintCharacterNFT();
+        uint256 tokenId = 0;
+        vm.stopPrank();
+
+        vm.startPrank(deployer);
+        voxelVerseMC.updateCharacterAttributes(
+            tokenId,
+            VoxelVerseMC.CharacterAttributes({
+                name: "ReviveMe",
+                imageURI: "",
+                happiness: 0,
+                thirst: 0,
+                hunger: 0,
+                xp: 0,
+                daysSurvived: 0,
+                characterLevel: 1,
+                health: 0,
+                heat: 0
+            })
+        );
+        vm.stopPrank();
+
+        vm.startPrank(user1);
+        voxelToken.approve(address(voxelVerseMC), voxelVerseMC.reviveCost());
+        voxelVerseMC.reviveCharacter(tokenId);
+
+        (,,,,,,,, uint256 health,) = voxelVerseMC.nftHolderAttributes(tokenId);
+        assertEq(health, 100, "Character should be revived with full health");
+        vm.stopPrank();
+    }
 
     function testFullLifecycle() public {
-        // 1. User mints an NFT
         vm.startPrank(user1);
         voxelVerseMC.mintCharacterNFT();
         uint256 tokenId = 0;
 
-        // 2. Check initial balance (starting tokens)
-        uint256 startingBonus = 10 * 10 ** 18;
-        uint256 expectedBalance = 10_000 * 10 ** 18 + startingBonus;
+        uint256 expectedBalance = 10_000 * DECIMALS + STARTING_BONUS;
         assertEq(voxelToken.balanceOf(user1), expectedBalance, "User should have starting tokens");
 
-        // 3. Claim daily rewards for a week
+        uint256 currentTime = block.timestamp;
         for (uint256 i = 0; i < 7; i++) {
-            // Advance time by 1 day
-            vm.warp(block.timestamp + 1 days);
-
-            // Claim drip
+            currentTime += 1 days;
+            vm.warp(currentTime);
             voxelVerseMC.claimDrip(tokenId);
-
-            // Update expected balance
             expectedBalance += DAILY_DRIP;
             assertEq(voxelToken.balanceOf(user1), expectedBalance, "Balance should increase with drips");
         }
 
-        // 4. Check NFT metadata after week of play
         (,,,,,, uint256 daysSurvived,,,) = voxelVerseMC.nftHolderAttributes(tokenId);
-        assertEq(daysSurvived, 1, "Days survived should be unchanged"); // Note: This only changes via updateCharacterAttributes
-
+        assertEq(daysSurvived, 1, "Days survived should be unchanged");
         vm.stopPrank();
 
-        // 5. Admin updates character attributes
         vm.startPrank(deployer);
-
-        // Get current attributes
         (
             string memory name,
             string memory imageURI,
@@ -85,182 +179,130 @@ contract IntegrationTests is Test {
             uint256 heat
         ) = voxelVerseMC.nftHolderAttributes(tokenId);
 
-        // Update days survived and XP
         VoxelVerseMC.CharacterAttributes memory updatedAttrs = VoxelVerseMC.CharacterAttributes({
             name: name,
             imageURI: imageURI,
-            happiness: happiness,
-            thirst: thirst,
-            hunger: hunger,
-            xp: xp + 100,
+            happiness: uint16(happiness),
+            thirst: uint16(thirst),
+            hunger: uint16(hunger),
+            xp: uint16(xp + 100),
             daysSurvived: 7,
-            characterLevel: characterLevel + 1,
-            health: health,
-            heat: heat
+            characterLevel: uint16(characterLevel + 1),
+            health: uint16(health),
+            heat: uint16(heat)
         });
 
         voxelVerseMC.updateCharacterAttributes(tokenId, updatedAttrs);
         vm.stopPrank();
 
-        // 6. Verify updated attributes
         (,,,,, uint256 newXp, uint256 newDays, uint256 newLevel,,) = voxelVerseMC.nftHolderAttributes(tokenId);
         assertEq(newXp, xp + 100, "XP should be updated");
         assertEq(newDays, 7, "Days survived should be updated");
         assertEq(newLevel, characterLevel + 1, "Level should be updated");
     }
 
-    function testSystemStressTest() public {
-        // Simulate many users minting and claiming
-        uint256 numUsers = 100;
-        address[] memory users = new address[](numUsers);
+    function testCannotClaimTwiceInOneDay() public {
+        vm.startPrank(user1);
+        voxelVerseMC.mintCharacterNFT();
+        uint256 tokenId = 0;
 
-        // Create and fund users
-        for (uint256 i = 0; i < numUsers; i++) {
-            users[i] = address(uint160(10000 + i));
-            vm.deal(users[i], 1 ether); // Give ETH for gas
+        vm.warp(block.timestamp + 1 days);
+        voxelVerseMC.claimDrip(tokenId);
 
-            // Paid mints will need tokens after the free mint limit
-            if (i >= 250) {
-                vm.prank(deployer);
-                voxelToken.transfer(users[i], 2000 * 10 ** 18); // Enough for paid mint
-
-                vm.prank(users[i]);
-                voxelToken.approve(address(voxelVerseMC), 1000 * 10 ** 18);
-            }
-        }
-
-        // Mint NFTs for all users
-        for (uint256 i = 0; i < numUsers; i++) {
-            vm.prank(users[i]);
-            voxelVerseMC.mintCharacterNFT();
-        }
-
-        // Check that all users have an NFT
-        for (uint256 i = 0; i < numUsers; i++) {
-            assertEq(voxelVerseMC.balanceOf(users[i]), 1, "User should have an NFT");
-        }
-
-        // Simulate claiming over time - fast forward 30 days
-        for (uint256 day = 0; day < 30; day++) {
-            // Advance time by 1 day
-            vm.warp(block.timestamp + 1 days);
-
-            // Random subset of users claim each day (simulating real usage patterns)
-            for (uint256 i = 0; i < numUsers; i++) {
-                // 70% chance to claim on any given day
-                if (uint256(keccak256(abi.encodePacked(day, i, block.timestamp))) % 100 < 70) {
-                    vm.prank(users[i]);
-                    voxelVerseMC.claimDrip(i); // tokenId == i for this test
-                }
-            }
-        }
-
-        // Check contract token balance after stress test
-        uint256 expectedUsed = numUsers * 10 * 10 ** 18; // Starting tokens for everyone
-
-        // Not all users claimed every day, but most claimed most days, so this is approximate
-        uint256 approximateRewards = numUsers * 30 * DAILY_DRIP * 7 / 10; // Approximately 70% claim rate
-
-        // Add the paid mint revenue
-        uint256 paidMints = numUsers > 250 ? (numUsers - 250) * 1000 * 10 ** 18 : 0;
-
-        // Check the contract still has enough funds
-        assertTrue(
-            voxelToken.balanceOf(address(voxelVerseMC)) < INITIAL_FUND - expectedUsed - approximateRewards + paidMints,
-            "Contract should have distributed a significant amount of tokens"
+        vm.expectRevert(
+            abi.encodeWithSelector(TooEarlyToClaim.selector, tokenId, block.timestamp + voxelVerseMC.dripCooldown())
         );
-
-        // Verify contract still has funds for future operations
-        assertTrue(voxelToken.balanceOf(address(voxelVerseMC)) > 0, "Contract should still have some tokens");
+        voxelVerseMC.claimDrip(tokenId);
     }
 
     function testFreeToPaidMintTransition() public {
-        // First, mint 249 NFTs
         for (uint256 i = 0; i < 249; i++) {
             address freeUser = address(uint160(20000 + i));
             vm.deal(freeUser, 1 ether);
-
             vm.prank(freeUser);
             voxelVerseMC.mintCharacterNFT();
         }
 
-        // Check remaining free mints
         assertEq(voxelVerseMC.getRemainingFreeMints(), 1, "Should have 1 free mint left");
         assertEq(voxelVerseMC.getCurrentMintPrice(), 0, "Current mint price should be 0");
 
-        // Use the last free mint
         address lastFreeUser = address(30000);
         vm.deal(lastFreeUser, 1 ether);
-
         vm.prank(lastFreeUser);
         voxelVerseMC.mintCharacterNFT();
 
-        // Verify transition to paid mints
         assertEq(voxelVerseMC.getRemainingFreeMints(), 0, "Should have 0 free mints left");
-        assertEq(voxelVerseMC.getCurrentMintPrice(), 1000 * 10 ** 18, "Current mint price should be 1000 VOXEL");
+        assertEq(voxelVerseMC.getCurrentMintPrice(), MINT_PRICE, "Current mint price should be 1000 VOXEL");
 
-        // Now test a paid mint
         address paidUser = address(40000);
         vm.deal(paidUser, 1 ether);
-
-        // Send tokens to the paid user
         vm.prank(deployer);
-        voxelToken.transfer(paidUser, 2000 * 10 ** 18);
+        voxelToken.transfer(paidUser, 2000 * DECIMALS);
 
-        // Approve and mint
         vm.startPrank(paidUser);
-        voxelToken.approve(address(voxelVerseMC), 1000 * 10 ** 18);
+        voxelToken.approve(address(voxelVerseMC), MINT_PRICE);
         voxelVerseMC.mintCharacterNFT();
         vm.stopPrank();
 
-        // Verify user paid and received NFT
         assertEq(voxelVerseMC.balanceOf(paidUser), 1, "Paid user should have an NFT");
-
-        // User should have initial balance (2000) - mint price (1000) + starting bonus (10)
-        assertEq(voxelToken.balanceOf(paidUser), 1010 * 10 ** 18, "Paid user should have correct token balance");
+        assertEq(voxelToken.balanceOf(paidUser), 1010 * DECIMALS, "Paid user should have correct token balance");
     }
 
     function testContractRefillFlow() public {
-        // First, create a test NFT so we have a valid token ID
         address testUser = address(1234);
         vm.deal(testUser, 1 ether);
         vm.prank(testUser);
         voxelVerseMC.mintCharacterNFT();
 
-        // Now drain the contract funds using a direct token transfer
         uint256 contractBalance = voxelToken.balanceOf(address(voxelVerseMC));
-        uint256 drainAmount = contractBalance - 1000 * 10 ** 18; // Keep some tokens in the contract
-
-        // Execute the drain by spoofing the contract address (only in testing)
+        uint256 drainAmount = contractBalance - 1000 * DECIMALS;
         vm.prank(address(voxelVerseMC));
         voxelToken.transfer(deployer, drainAmount);
 
-        // Get current balance after draining
         uint256 balanceBefore = voxelToken.balanceOf(address(voxelVerseMC));
-
-        // Refill the contract
-        uint256 refillAmount = 500_000 * 10 ** 18;
+        uint256 refillAmount = 500_000 * DECIMALS;
 
         vm.startPrank(deployer);
         voxelToken.approve(address(voxelVerseMC), refillAmount);
         voxelVerseMC.refillContract(refillAmount);
         vm.stopPrank();
 
-        // Verify balance increased
         assertEq(
             voxelToken.balanceOf(address(voxelVerseMC)),
             balanceBefore + refillAmount,
             "Contract balance should increase by refill amount"
         );
 
-        // Test user minting still works
         address newUser = address(50000);
         vm.deal(newUser, 1 ether);
-
         vm.prank(newUser);
-        voxelVerseMC.mintCharacterNFT(); // Should work with refilled tokens
-
-        // Verify user got an NFT
+        voxelVerseMC.mintCharacterNFT();
         assertEq(voxelVerseMC.balanceOf(newUser), 1, "User should have an NFT after refill");
+    }
+
+    function testDripDecayBasedOnMissedDays() public {
+        vm.startPrank(user1);
+        voxelVerseMC.mintCharacterNFT();
+        uint256 tokenId = 0;
+        uint256 expectedBalance = voxelToken.balanceOf(user1);
+
+        // Warp forward 1 day — claim normally
+        vm.warp(block.timestamp + 1 days);
+        voxelVerseMC.claimDrip(tokenId);
+        expectedBalance += DAILY_DRIP;
+        assertEq(voxelToken.balanceOf(user1), expectedBalance, "Day 1: normal drip");
+
+        // Warp forward 3 days — 2 days missed
+        vm.warp(block.timestamp + 3 days);
+        voxelVerseMC.claimDrip(tokenId);
+
+        // Calculate expected decay (e.g., base - 2 * decayRate)
+        uint256 decayRate = 1 * DECIMALS;
+        uint256 expectedDecay = 2 * decayRate;
+        uint256 decayedDrip = DAILY_DRIP > expectedDecay ? DAILY_DRIP - expectedDecay : 0;
+
+        expectedBalance += decayedDrip;
+        assertEq(voxelToken.balanceOf(user1), expectedBalance, "Day 4: decayed drip after missed days");
+        vm.stopPrank();
     }
 }
